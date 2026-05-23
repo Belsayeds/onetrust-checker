@@ -12,7 +12,9 @@ function normaliseUrl(url) {
 }
 
 function cleanUdid(udid = "") {
-  return udid.replace("-test", "");
+  return udid.toLowerCase().endsWith("-test")
+    ? udid.slice(0, -5)
+    : udid;
 }
 
 function isTestScript(udid = "") {
@@ -21,12 +23,14 @@ function isTestScript(udid = "") {
 
 const notes = [];
 const apiCalls = [];
-const jsonResponses = [];
 const otStubNetworkCalls = [];
+const possibleJsonResponses = [];
 
 let accessDenied = false;
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({
+  headless: true
+});
 
 const page = await browser.newPage({
   viewport: { width: 1366, height: 768 },
@@ -58,24 +62,22 @@ page.on("response", async response => {
     status: response.status()
   });
 
-  const lowerUrl = url.toLowerCase();
+  try {
+    const urlObj = new URL(url);
+    const pathname = urlObj.pathname.toLowerCase();
 
-  const isPotentialOneTrustJson =
-    lowerUrl.includes("cdn.cookielaw.org") &&
-    lowerUrl.includes(".json");
+    if (pathname.endsWith(".json")) {
+      const bodyText = await response.text();
 
-  if (isPotentialOneTrustJson) {
-    try {
-      const text = await response.text();
-
-      jsonResponses.push({
+      possibleJsonResponses.push({
         url,
         status: response.status(),
-        bodyText: text
+        resourceType: request.resourceType(),
+        bodyText
       });
-    } catch {
-      notes.push(`Could not read JSON response body: ${url}`);
     }
+  } catch {
+    notes.push(`Could not process JSON response body: ${url}`);
   }
 });
 
@@ -143,32 +145,29 @@ const usingTestScript = isTestScript(primaryUdid);
 let capturedConfig = null;
 let capturedConfigUrl = "";
 
-for (const item of jsonResponses) {
-  const lowerUrl = item.url.toLowerCase();
-
-  const urlMatchesUdid =
-    primaryUdid &&
-    (
-      lowerUrl.includes(primaryUdid.toLowerCase()) ||
-      lowerUrl.includes(productionUdid.toLowerCase())
-    );
-
-  if (!urlMatchesUdid) {
-    continue;
-  }
-
+for (const item of possibleJsonResponses) {
   try {
+    const pathname = new URL(item.url).pathname.toLowerCase();
+
+    const isTargetUdidJson =
+      productionUdid &&
+      pathname.endsWith(`/${productionUdid.toLowerCase()}.json`);
+
+    if (!isTargetUdidJson) {
+      continue;
+    }
+
     capturedConfig = JSON.parse(item.bodyText);
     capturedConfigUrl = item.url;
     break;
   } catch {
-    notes.push(`Matched UDID JSON URL but could not parse body as JSON: ${item.url}`);
+    notes.push(`Found possible UDID JSON but could not parse it: ${item.url}`);
   }
 }
 
 if (!capturedConfig && productionUdid) {
   notes.push(
-    `No matching UDID JSON response was captured for UDID: ${primaryUdid}.`
+    `No matching UDID JSON config response was captured for UDID: ${primaryUdid}.`
   );
 }
 
@@ -197,7 +196,16 @@ fs.writeFileSync("debug-page.html", await page.content());
 
 fs.writeFileSync(
   "debug-json-responses.json",
-  JSON.stringify(jsonResponses, null, 2)
+  JSON.stringify(
+    possibleJsonResponses.map(item => ({
+      url: item.url,
+      status: item.status,
+      resourceType: item.resourceType,
+      bodyPreview: item.bodyText.slice(0, 1000)
+    })),
+    null,
+    2
+  )
 );
 
 const result = {

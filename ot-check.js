@@ -11,71 +11,22 @@ function normaliseUrl(url) {
   return url.startsWith("http") ? url : `https://${url}`;
 }
 
-function pickFields(configJson = {}) {
-  return {
-    AuthenticatedConsent: configJson.AuthenticatedConsent ?? "",
-    BulkDomainCheckUrl: configJson.BulkDomainCheckUrl ?? "",
-    CDNLocation: configJson.CDNLocation ?? "",
-    CookieSPAEnabled: configJson.CookieSPAEnabled ?? "",
-    CookieSameSiteNoneEnabled: configJson.CookieSameSiteNoneEnabled ?? "",
-    CookieV2CSPEnabled: configJson.CookieV2CSPEnabled ?? "",
-    DataLanguage: configJson.DataLanguage ?? "",
-    DisclosureCDNUrl: configJson.DisclosureCDNUrl ?? "",
-    Domain: configJson.Domain ?? "",
-    EnvId: configJson.EnvId ?? "",
-    GATrackAssignedCategory: configJson.GATrackAssignedCategory ?? "",
-    GATrackToggle: configJson.GATrackToggle ?? "",
-    GeoRuleGroupName: configJson.GeoRuleGroupName ?? "",
-    GeolocationUrl: configJson.GeolocationUrl ?? "",
-    GoogleData: configJson.GoogleData ?? {},
-    GppData: configJson.GppData ?? {},
-    Iab2V2Data: configJson.Iab2V2Data ?? {},
-    IabData: configJson.IabData ?? {},
-    IabV2Data: configJson.IabV2Data ?? {},
-    IsSuppressBanner: configJson.IsSuppressBanner ?? "",
-    IsSuppressPC: configJson.IsSuppressPC ?? "",
-    LanguageDetectionByHtml: configJson.LanguageDetectionByHtml ?? "",
-    LanguageDetectionEnabled: configJson.LanguageDetectionEnabled ?? "",
-    MobileSDK: configJson.MobileSDK ?? "",
-    MultiVariantTestingEnabled: configJson.MultiVariantTestingEnabled ?? "",
-    OptanonDataJSON: configJson.OptanonDataJSON ?? "",
-    PublisherCC: configJson.PublisherCC ?? "",
-    RemoteActionsEnabled: configJson.RemoteActionsEnabled ?? "",
-    RootDomainConsentEnabled: configJson.RootDomainConsentEnabled ?? "",
-    RootDomainUrl: configJson.RootDomainUrl ?? "",
-    RuleSet: Array.isArray(configJson.RuleSet)
-      ? configJson.RuleSet.map(r => ({
-          Id: r.Id ?? "",
-          Name: r.Name ?? ""
-        }))
-      : [],
-    ScriptDynamicLoadEnabled: configJson.ScriptDynamicLoadEnabled ?? "",
-    ScriptType: configJson.ScriptType ?? "",
-    SkipGeolocation: configJson.SkipGeolocation ?? "",
-    TenantFeatures: {
-      CookieV2BannerFocus: configJson.TenantFeatures?.CookieV2BannerFocus ?? "",
-      CookieV2RejectAll: configJson.TenantFeatures?.CookieV2RejectAll ?? "",
-      CookieV2TargetedTemplates: configJson.TenantFeatures?.CookieV2TargetedTemplates ?? ""
-    },
-    TenantGuid: configJson.TenantGuid ?? "",
-    UseV2: configJson.UseV2 ?? "",
-    Version: configJson.Version ?? "",
-    WebFormIntegrationEnabled: configJson.WebFormIntegrationEnabled ?? "",
-    WebFormSrcUrl: configJson.WebFormSrcUrl ?? "",
-    WebFormWorkerUrl: configJson.WebFormWorkerUrl ?? ""
-  };
+function cleanUdid(udid = "") {
+  return udid.replace("-test", "");
+}
+
+function isTestScript(udid = "") {
+  return udid.toLowerCase().endsWith("-test");
 }
 
 const notes = [];
 const apiCalls = [];
+const jsonResponses = [];
 const otStubNetworkCalls = [];
 
-let capturedConfig = null;
-let capturedConfigUrl = "";
+let accessDenied = false;
 
-const browser = await chromium.launch({
-  headless: true
-});
+const browser = await chromium.launch({ headless: true });
 
 const page = await browser.newPage({
   viewport: { width: 1366, height: 768 },
@@ -109,27 +60,21 @@ page.on("response", async response => {
 
   const lowerUrl = url.toLowerCase();
 
-  const looksLikeOtJson =
+  const isPotentialOneTrustJson =
     lowerUrl.includes("cdn.cookielaw.org") &&
-    lowerUrl.endsWith(".json");
+    lowerUrl.includes(".json");
 
-  if (looksLikeOtJson && !capturedConfig) {
+  if (isPotentialOneTrustJson) {
     try {
-      const body = await response.text();
-      const json = JSON.parse(body);
+      const text = await response.text();
 
-      if (
-        json.TenantGuid ||
-        json.EnvId ||
-        json.Domain ||
-        json.RuleSet ||
-        json.TenantFeatures
-      ) {
-        capturedConfig = json;
-        capturedConfigUrl = url;
-      }
+      jsonResponses.push({
+        url,
+        status: response.status(),
+        bodyText: text
+      });
     } catch {
-      // Ignore non-JSON response bodies.
+      notes.push(`Could not read JSON response body: ${url}`);
     }
   }
 });
@@ -147,6 +92,17 @@ try {
   await page.waitForTimeout(15000);
 } catch (error) {
   notes.push(`Page navigation issue: ${error.message}`);
+}
+
+const bodyText = await page.locator("body").innerText().catch(() => "");
+
+if (
+  bodyText.includes("Access Denied") ||
+  bodyText.includes("You don't have permission to access") ||
+  page.url().includes("errors.edgesuite.net")
+) {
+  accessDenied = true;
+  notes.push("Access denied by CDN/WAF. Playwright could not access the real page.");
 }
 
 const allFrameScripts = [];
@@ -180,6 +136,42 @@ const dataDomainScriptValues = stubScripts
   .map(script => script.dataDomainScript)
   .filter(Boolean);
 
+const primaryUdid = dataDomainScriptValues[0] || "";
+const productionUdid = cleanUdid(primaryUdid);
+const usingTestScript = isTestScript(primaryUdid);
+
+let capturedConfig = null;
+let capturedConfigUrl = "";
+
+for (const item of jsonResponses) {
+  const lowerUrl = item.url.toLowerCase();
+
+  const urlMatchesUdid =
+    primaryUdid &&
+    (
+      lowerUrl.includes(primaryUdid.toLowerCase()) ||
+      lowerUrl.includes(productionUdid.toLowerCase())
+    );
+
+  if (!urlMatchesUdid) {
+    continue;
+  }
+
+  try {
+    capturedConfig = JSON.parse(item.bodyText);
+    capturedConfigUrl = item.url;
+    break;
+  } catch {
+    notes.push(`Matched UDID JSON URL but could not parse body as JSON: ${item.url}`);
+  }
+}
+
+if (!capturedConfig && productionUdid) {
+  notes.push(
+    `No matching UDID JSON response was captured for UDID: ${primaryUdid}.`
+  );
+}
+
 if (stubScripts.length === 0 && otStubNetworkCalls.length === 0) {
   notes.push("otSDKStub.js was not found in DOM scripts or network calls.");
 }
@@ -196,12 +188,6 @@ if (stubScripts.length > 1 || otStubNetworkCalls.length > 1) {
   );
 }
 
-if (!capturedConfig) {
-  notes.push(
-    "No OneTrust JSON config response was captured. The config may be blocked, delayed, loaded from a different CDN path, or require a specific region/session."
-  );
-}
-
 await page.screenshot({
   path: "debug-screenshot.png",
   fullPage: true
@@ -209,9 +195,16 @@ await page.screenshot({
 
 fs.writeFileSync("debug-page.html", await page.content());
 
+fs.writeFileSync(
+  "debug-json-responses.json",
+  JSON.stringify(jsonResponses, null, 2)
+);
+
 const result = {
   checkedUrl: normaliseUrl(targetUrl),
   checkedAt: new Date().toISOString(),
+
+  accessDenied,
 
   otSDKStub: {
     found: stubScripts.length > 0 || otStubNetworkCalls.length > 0,
@@ -219,7 +212,15 @@ const result = {
     networkCount: otStubNetworkCalls.length,
     scripts: stubScripts,
     networkCalls: otStubNetworkCalls,
-    dataDomainScriptValues
+    dataDomainScriptValues,
+    primaryUdid,
+    productionUdid,
+    usingTestScript,
+    scriptEnvironment: primaryUdid
+      ? usingTestScript
+        ? "test"
+        : "production"
+      : "unknown"
   },
 
   capturedConfigUrl,
@@ -228,7 +229,7 @@ const result = {
   EnvId: capturedConfig?.EnvId ?? "",
   Domain: capturedConfig?.Domain ?? "",
 
-  config: pickFields(capturedConfig ?? {}),
+  config: capturedConfig ?? {},
 
   apiCalls,
 

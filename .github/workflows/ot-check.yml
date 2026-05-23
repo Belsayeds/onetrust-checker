@@ -39,4 +39,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: ot-check-result
-          path: ot-check-result.json
+          path: |
+            ot-check-result.json
+            debug-screenshot.png
+            debug-page.html
